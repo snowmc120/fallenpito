@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 import urllib.request
@@ -309,7 +310,8 @@ HTML_UI = r"""
           const { done, value } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\\\\n');
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
 
           for (const line of lines) {
             if (!line.trim()) continue;
@@ -560,12 +562,14 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+PORT = int(os.environ.get("PORT", 8000))
+
 def heartbeat_ping():
     while True:
         time.sleep(15)
         t0 = time.time()
         try:
-            urllib.request.urlopen("http://127.0.0.1:8000/ping", timeout=3).read()
+            urllib.request.urlopen(f"http://127.0.0.1:{PORT}/ping", timeout=3).read()
             ping_ms = round((time.time() - t0) * 1000, 1)
             now = time.strftime("%H:%M:%S")
             print(f"\r[{now}] 💓 PING OK: {ping_ms}ms   ", end="", flush=True)
@@ -574,7 +578,7 @@ def heartbeat_ping():
 
 if __name__ == "__main__":
     print("=" * 44)
-    print("🚀 TURBO MEDIA SERVER: http://127.0.0.1:8000")
+    print(f"🚀 TURBO MEDIA SERVER: http://127.0.0.1:{PORT}")
     print("=" * 44)
     threading.Thread(target=heartbeat_ping, daemon=True).start()
-    ThreadingHTTPServer(("127.0.0.1", 8000), Handler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
