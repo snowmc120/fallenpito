@@ -14,6 +14,15 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp")
 VIDEO_EXTS = (".mp4", ".webm", ".mov", ".m4v", ".ogv")
 
+TAB_TO_SEGMENT = {
+    "image": "anh",
+    "video": "video",
+    "comment": "binh-luan",
+    "link": "link",
+}
+
+SEGMENT_TO_TAB = {v: k for k, v in TAB_TO_SEGMENT.items()}
+
 
 def slugify_name(text):
     text = unicodedata.normalize("NFD", text or "")
@@ -23,7 +32,7 @@ def slugify_name(text):
     return slug or "thread"
 
 
-def build_custom_route(raw_url, title=""):
+def extract_title_slug(raw_url, title=""):
     parsed = urlparse(raw_url)
     path_parts = [
         p for p in parsed.path.split("/")
@@ -33,29 +42,57 @@ def build_custom_route(raw_url, title=""):
     if not source_name and path_parts:
         last_seg = path_parts[-1]
         source_name = re.sub(r"\.\d+$", "", last_seg)
-    slug = slugify_name(source_name)
-    return f"/locanhvideo/{slug}"
+    return slugify_name(source_name)
+
+
+def build_custom_route(raw_url, title="", tab_key="image"):
+    seg = TAB_TO_SEGMENT.get(tab_key, "anh")
+    slug = extract_title_slug(raw_url, title)
+    return f"/locanhvideo/{seg}/{slug}"
+
+
+def parse_classified_route(route_path):
+    m = re.match(
+        r"^/locanhvideo/(anh|video|binh-luan|link)/([^/]+?)(?:/page(\d+))?/?$",
+        route_path or "",
+    )
+    if not m:
+        return None
+    seg = m.group(1)
+    slug = m.group(2)
+    page_num = int(m.group(3)) if m.group(3) else 1
+    return {
+        "segment": seg,
+        "tab": SEGMENT_TO_TAB.get(seg, "image"),
+        "slug": slug,
+        "base_route": f"/locanhvideo/{seg}/{slug}",
+        "page": page_num,
+    }
 
 
 def find_cached_by_route(route_path):
-    m = re.match(r"^(/locanhvideo/[^/]+?)(?:/page(\d+))?/?$", route_path or "")
-    if not m:
-        return None, 1
-    base_route = m.group(1)
-    page_num = int(m.group(2)) if m.group(2) else 1
+    parsed_route = parse_classified_route(route_path)
+    if not parsed_route:
+        return None, 1, "image"
+    target_slug = parsed_route["slug"]
+    page_num = parsed_route["page"]
+    tab_key = parsed_route["tab"]
+
     for item in list_cached_threads():
-        if item.get("route") == base_route:
-            cache_file = get_cache_path(item["url"])
+        title = item.get("title") or item.get("url", "")
+        url = item.get("url", "")
+        item_slug = extract_title_slug(url, title)
+        if item_slug == target_slug:
+            cache_file = get_cache_path(url)
             if os.path.exists(cache_file):
                 try:
                     with open(cache_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    if "route" not in data:
-                        data["route"] = base_route
-                    return data, page_num
+                    data["route"] = build_custom_route(url, data.get("title", ""), tab_key)
+                    return data, page_num, tab_key
                 except Exception:
                     pass
-    return None, page_num
+    return None, page_num, tab_key
 
 
 def has_supported_media_ext(full_url, exts):
@@ -93,7 +130,7 @@ def list_cached_threads():
             items.append({
                 "title": title,
                 "url": url,
-                "route": data.get("route") or build_custom_route(url, title),
+                "route": build_custom_route(url, title, "image"),
                 "img_count": len(data.get("images", [])),
                 "vid_count": len(data.get("videos", [])),
                 "cmt_count": len(data.get("comments", [])),
@@ -215,8 +252,7 @@ def crawl_fast_stream(raw_url, cookie, max_pages, force_refresh=False):
     if not force_refresh and os.path.exists(cache_file):
         with open(cache_file, "r", encoding="utf-8") as f:
             cached_data = json.load(f)
-        if "route" not in cached_data:
-            cached_data["route"] = build_custom_route(base_url, cached_data.get("title", ""))
+        cached_data["route"] = build_custom_route(base_url, cached_data.get("title", ""), "image")
         yield {"cached": True, "data": cached_data}
         return
 
@@ -237,7 +273,7 @@ def crawl_fast_stream(raw_url, cookie, max_pages, force_refresh=False):
     soup1, imgs1, vids1, cmts1, lks1 = parse_html(res1.text, base_url, 1)
     title_el = soup1.select_one("h1.p-title-value") or soup1.title
     title = title_el.get_text(strip=True) if title_el else base_url
-    route = build_custom_route(base_url, title)
+    route = build_custom_route(base_url, title, "image")
 
     total_pages = min(detect_total_pages(soup1), max_pages)
 
