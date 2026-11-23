@@ -7,7 +7,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
-from crawler import crawl_fast_stream, list_cached_threads, find_cached_by_route
+from crawler import crawl_fast_stream, list_cached_threads, find_cached_by_route, parse_classified_route
 
 HTML_UI = r"""
 <!DOCTYPE html>
@@ -194,13 +194,28 @@ HTML_UI = r"""
   </div>
 
   <script>
+    const HISTORY_STORAGE_KEY = 'fallenpito_history_all';
+    const TAB_SEGMENT_MAP = {
+      image: 'anh',
+      video: 'video',
+      comment: 'binh-luan',
+      link: 'link'
+    };
+    const SEGMENT_TAB_MAP = {
+      'anh': 'image',
+      'video': 'video',
+      'binh-luan': 'comment',
+      'link': 'link'
+    };
+
     let store = { image: [], video: [], comment: [], link: [] };
     let currentTab = 'image';
     let currentMediaPage = 1;
     let isCrawlDone = false;
     const MEDIA_PER_PAGE = 6;
     let renderLimit = 40;
-    let currentRoute = '';
+    let currentSlug = '';
+    let currentTitle = '';
     let lastActiveUrl = localStorage.getItem('fallenpito_last_url') || '';
     let abortCtrl = null;
     let currentIdx = 0;
@@ -212,37 +227,75 @@ HTML_UI = r"""
     }
     function saveCookie() { localStorage.setItem('xam_cookie', document.getElementById('cookieInput').value.trim()); }
 
-    function parsePageFromPath(pathname) {
-      const m = (pathname || '').match(/^(\/locanhvideo\/[^/]+?)(?:\/page(\d+))?\/?$/);
-      if (!m) return { route: '', page: 1 };
-      return { route: m[1], page: m[2] ? parseInt(m[2], 10) : 1 };
+    function slugifyClient(text) {
+      return (text || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/đ/g, 'd')
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '') || 'thread';
     }
 
-    function updateRouteDisplay(route, pageNum, pushHistory) {
+    function extractSlugFromUrlOrTitle(rawUrl, title) {
+      if (title && title !== rawUrl) {
+        return slugifyClient(title);
+      }
+      try {
+        const u = new URL(rawUrl);
+        const parts = u.pathname.split('/').filter(p => p && !/^(page-\d+|post-\d+|latest|unread)$/i.test(p));
+        if (parts.length) {
+          return slugifyClient(parts[parts.length - 1].replace(/\.\d+$/, ''));
+        }
+      } catch (e) {}
+      return slugifyClient(title || rawUrl);
+    }
+
+    function getCurrentBaseRoute() {
+      if (!currentSlug) return '';
+      const seg = TAB_SEGMENT_MAP[currentTab] || 'anh';
+      return `/locanhvideo/${seg}/${currentSlug}`;
+    }
+
+    function parsePageFromPath(pathname) {
+      const m = (pathname || '').match(/^\/locanhvideo\/(anh|video|binh-luan|link)\/([^/]+?)(?:\/page(\d+))?\/?$/);
+      if (!m) return null;
+      const seg = m[1];
+      return {
+        segment: seg,
+        tab: SEGMENT_TAB_MAP[seg] || 'image',
+        slug: m[2],
+        page: m[3] ? parseInt(m[3], 10) : 1
+      };
+    }
+
+    function updateRouteDisplay(pageNum, pushHistory) {
       const bar = document.getElementById('routeBar');
-      if (!route) {
+      const baseRoute = getCurrentBaseRoute();
+      if (!baseRoute) {
         bar.style.display = 'none';
         return;
       }
-      currentRoute = route;
       const p = pageNum || currentMediaPage || 1;
       const suffix = (currentTab === 'image' || currentTab === 'video') ? `/page${p}` : '';
-      const fullPath = `${route}${suffix}`;
+      const fullPath = `${baseRoute}${suffix}`;
       bar.style.display = 'block';
       bar.textContent = `Đường dẫn: ${window.location.origin}${fullPath}`;
       try {
+        const stateObj = { slug: currentSlug, title: currentTitle, page: p, tab: currentTab };
         if (pushHistory && window.location.pathname !== fullPath) {
-          history.pushState({ route, page: p, tab: currentTab }, '', fullPath);
+          history.pushState(stateObj, '', fullPath);
         } else if (window.location.pathname !== fullPath) {
-          history.replaceState({ route, page: p, tab: currentTab }, '', fullPath);
+          history.replaceState(stateObj, '', fullPath);
         }
       } catch (e) {}
     }
 
     window.addEventListener('popstate', (e) => {
       const state = e.state;
-      if (state && state.route) {
-        currentRoute = state.route;
+      if (state && state.slug) {
+        currentSlug = state.slug;
+        if (state.title) currentTitle = state.title;
         if (state.tab) currentTab = state.tab;
         currentMediaPage = state.page || 1;
         document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
@@ -254,11 +307,45 @@ HTML_UI = r"""
         return;
       }
       const parsed = parsePageFromPath(window.location.pathname);
-      if (parsed.route && currentRoute === parsed.route && (currentTab === 'image' || currentTab === 'video')) {
+      if (parsed && currentSlug === parsed.slug) {
+        currentTab = parsed.tab;
         currentMediaPage = parsed.page;
+        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+        const activeBtn = document.getElementById('tab-' + currentTab);
+        if (activeBtn) activeBtn.classList.add('active');
         renderTab();
       }
     });
+
+    function getLocalHistory() {
+      try {
+        const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+        const arr = raw ? JSON.parse(raw) : [];
+        return Array.isArray(arr) ? arr : [];
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function saveLocalHistory(item) {
+      if (!item || !item.url) return;
+      const list = getLocalHistory();
+      const existing = list.find(x => x.url === item.url);
+      const merged = {
+        title: item.title || (existing && existing.title) || item.url,
+        url: item.url,
+        slug: item.slug || (existing && existing.slug) || extractSlugFromUrlOrTitle(item.url, item.title),
+        img_count: item.img_count ?? (existing ? existing.img_count : 0),
+        vid_count: item.vid_count ?? (existing ? existing.vid_count : 0),
+        cmt_count: item.cmt_count ?? (existing ? existing.cmt_count : 0),
+        lnk_count: item.lnk_count ?? (existing ? existing.lnk_count : 0),
+        mtime: item.mtime || (existing && existing.mtime) || Math.floor(Date.now() / 1000)
+      };
+      const nextList = [merged, ...list.filter(x => x.url !== item.url)];
+      try {
+        localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(nextList));
+      } catch (e) {}
+    }
 
     function formatTimeAgo(ts) {
       if (!ts) return '';
@@ -270,50 +357,77 @@ HTML_UI = r"""
     }
 
     async function loadHistory() {
+      let mergedMap = new Map();
+      getLocalHistory().forEach(item => {
+        if (item && item.url) mergedMap.set(item.url, item);
+      });
+
       try {
         const res = await fetch('/history');
-        const list = await res.json();
-        const container = document.getElementById('historyList');
-        const countEl = document.getElementById('historyCount');
-        container.innerHTML = '';
-
-        if (!list || !list.length) {
-          countEl.textContent = '0 mục';
-          container.innerHTML = '<div style="text-align:center;color:#777;font-size:12px;padding:14px 0;">Chưa có link nào được lọc. Dán link phía trên để bắt đầu.</div>';
-          return;
+        const serverList = await res.json();
+        if (Array.isArray(serverList)) {
+          serverList.forEach(item => {
+            if (!item || !item.url) return;
+            const prev = mergedMap.get(item.url) || {};
+            const combined = {
+              title: item.title || prev.title || item.url,
+              url: item.url,
+              slug: extractSlugFromUrlOrTitle(item.url, item.title || prev.title),
+              img_count: item.img_count ?? prev.img_count ?? 0,
+              vid_count: item.vid_count ?? prev.vid_count ?? 0,
+              cmt_count: item.cmt_count ?? prev.cmt_count ?? 0,
+              lnk_count: item.lnk_count ?? prev.lnk_count ?? 0,
+              mtime: Math.max(item.mtime || 0, prev.mtime || 0) || Math.floor(Date.now() / 1000)
+            };
+            mergedMap.set(item.url, combined);
+            saveLocalHistory(combined);
+          });
         }
-
-        countEl.textContent = list.length + ' mục';
-        list.forEach(item => {
-          const card = document.createElement('div');
-          card.className = 'history-card';
-
-          const top = document.createElement('div');
-          top.className = 'history-top';
-          top.innerHTML = `<span class="history-status">Hoàn thành</span><span class="history-time">${formatTimeAgo(item.mtime)}</span>`;
-
-          const title = document.createElement('div');
-          title.className = 'history-title';
-          title.textContent = item.title;
-
-          const meta = document.createElement('div');
-          meta.className = 'history-meta';
-          meta.textContent = `${item.img_count} ảnh - ${item.vid_count} video - ${item.cmt_count} bình luận - ${item.lnk_count} link`;
-
-          card.appendChild(top);
-          card.appendChild(title);
-          card.appendChild(meta);
-          card.onclick = () => openHistoryItem(item);
-          container.appendChild(card);
-        });
       } catch (e) {}
+
+      const list = Array.from(mergedMap.values()).sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+      const container = document.getElementById('historyList');
+      const countEl = document.getElementById('historyCount');
+      container.innerHTML = '';
+
+      if (!list.length) {
+        countEl.textContent = '0 mục';
+        container.innerHTML = '<div style="text-align:center;color:#777;font-size:12px;padding:14px 0;">Chưa có link nào được lọc. Dán link phía trên để bắt đầu.</div>';
+        return;
+      }
+
+      countEl.textContent = list.length + ' mục';
+      list.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'history-card';
+
+        const top = document.createElement('div');
+        top.className = 'history-top';
+        top.innerHTML = `<span class="history-status">Hoàn thành</span><span class="history-time">${formatTimeAgo(item.mtime)}</span>`;
+
+        const title = document.createElement('div');
+        title.className = 'history-title';
+        title.textContent = item.title;
+
+        const meta = document.createElement('div');
+        meta.className = 'history-meta';
+        meta.textContent = `${item.img_count} ảnh - ${item.vid_count} video - ${item.cmt_count} bình luận - ${item.lnk_count} link`;
+
+        card.appendChild(top);
+        card.appendChild(title);
+        card.appendChild(meta);
+        card.onclick = () => openHistoryItem(item);
+        container.appendChild(card);
+      });
     }
 
     function openHistoryItem(item) {
       lastActiveUrl = item.url;
+      currentTitle = item.title || item.url;
+      currentSlug = item.slug || extractSlugFromUrlOrTitle(item.url, currentTitle);
       localStorage.setItem('fallenpito_last_url', lastActiveUrl);
       document.getElementById('threadUrl').value = item.url;
-      document.getElementById('viewerTitle').textContent = item.title;
+      document.getElementById('viewerTitle').textContent = currentTitle;
       startCrawl(false, 1);
     }
 
@@ -334,21 +448,38 @@ HTML_UI = r"""
     async function initFromCurrentPath() {
       await loadHistory();
       const parsed = parsePageFromPath(window.location.pathname);
-      if (parsed.route) {
+      if (parsed) {
+        currentTab = parsed.tab;
+        currentSlug = parsed.slug;
+        currentMediaPage = parsed.page;
+        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+        const activeBtn = document.getElementById('tab-' + currentTab);
+        if (activeBtn) activeBtn.classList.add('active');
+
         try {
           const res = await fetch('/lookup-route?path=' + encodeURIComponent(window.location.pathname));
           if (res.ok) {
             const info = await res.json();
             if (info && info.found && info.url) {
               lastActiveUrl = info.url;
+              currentTitle = info.title || info.url;
               localStorage.setItem('fallenpito_last_url', lastActiveUrl);
               document.getElementById('threadUrl').value = info.url;
-              if (info.title) document.getElementById('viewerTitle').textContent = info.title;
+              document.getElementById('viewerTitle').textContent = currentTitle;
               startCrawl(false, info.page || parsed.page || 1);
               return;
             }
           }
         } catch (e) {}
+
+        const localMatch = getLocalHistory().find(x => (x.slug || extractSlugFromUrlOrTitle(x.url, x.title)) === parsed.slug);
+        if (localMatch) {
+          lastActiveUrl = localMatch.url;
+          currentTitle = localMatch.title || localMatch.url;
+          document.getElementById('threadUrl').value = localMatch.url;
+          document.getElementById('viewerTitle').textContent = currentTitle;
+          startCrawl(false, parsed.page || 1);
+        }
       }
     }
 
@@ -360,7 +491,7 @@ HTML_UI = r"""
       document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
       document.getElementById('tab-' + tab).classList.add('active');
       resetRender();
-      if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage, true);
+      if (currentSlug) updateRouteDisplay(currentMediaPage, true);
     }
 
     function resetRender() {
@@ -386,8 +517,14 @@ HTML_UI = r"""
       try {
         const parsedInput = new URL(url);
         const pathInfo = parsePageFromPath(parsedInput.pathname);
-        if (pathInfo.route) {
+        if (pathInfo) {
           if (!targetPage) initialPage = pathInfo.page;
+          currentTab = pathInfo.tab;
+          currentSlug = pathInfo.slug;
+          document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+          const activeBtn = document.getElementById('tab-' + currentTab);
+          if (activeBtn) activeBtn.classList.add('active');
+
           const resLookup = await fetch('/lookup-route?path=' + encodeURIComponent(parsedInput.pathname));
           if (resLookup.ok) {
             const info = await resLookup.json();
@@ -400,7 +537,14 @@ HTML_UI = r"""
       } catch (e) {}
 
       lastActiveUrl = url;
+      if (!currentSlug) currentSlug = extractSlugFromUrlOrTitle(url, currentTitle);
       localStorage.setItem('fallenpito_last_url', lastActiveUrl);
+      saveLocalHistory({
+        title: currentTitle || url,
+        url,
+        slug: currentSlug,
+        mtime: Math.floor(Date.now() / 1000)
+      });
 
       if (abortCtrl) abortCtrl.abort();
       abortCtrl = new AbortController();
@@ -450,7 +594,7 @@ HTML_UI = r"""
             const msg = JSON.parse(line);
 
             if (msg.error) { pLabel.textContent = 'Lỗi: ' + msg.error; return; }
-            if (msg.route) updateRouteDisplay(msg.route, currentMediaPage, false);
+            if (currentSlug) updateRouteDisplay(currentMediaPage, false);
 
             if (msg.cached) {
               store.image = msg.data.images || [];
@@ -458,8 +602,22 @@ HTML_UI = r"""
               store.comment = msg.data.comments || [];
               store.link = msg.data.links || [];
               isCrawlDone = true;
-              if (msg.data.title) document.getElementById('viewerTitle').textContent = msg.data.title;
-              if (msg.data.route) updateRouteDisplay(msg.data.route, currentMediaPage, false);
+              if (msg.data.title) {
+                currentTitle = msg.data.title;
+                document.getElementById('viewerTitle').textContent = currentTitle;
+              }
+              currentSlug = extractSlugFromUrlOrTitle(msg.data.url || url, currentTitle);
+              updateRouteDisplay(currentMediaPage, false);
+              saveLocalHistory({
+                title: currentTitle || url,
+                url: msg.data.url || url,
+                slug: currentSlug,
+                img_count: store.image.length,
+                vid_count: store.video.length,
+                cmt_count: store.comment.length,
+                lnk_count: store.link.length,
+                mtime: Math.floor(Date.now() / 1000)
+              });
               updateCounters();
               renderTab();
               pLabel.textContent = 'Nạp tức thì từ Cache (bấm ↻ nếu muốn cào mới)';
@@ -485,6 +643,20 @@ HTML_UI = r"""
 
             if (msg.done) {
               isCrawlDone = true;
+              const vTitle = document.getElementById('viewerTitle').textContent;
+              if (vTitle && vTitle !== url) currentTitle = vTitle;
+              currentSlug = extractSlugFromUrlOrTitle(url, currentTitle);
+              updateRouteDisplay(currentMediaPage, false);
+              saveLocalHistory({
+                title: currentTitle || url,
+                url,
+                slug: currentSlug,
+                img_count: store.image.length,
+                vid_count: store.video.length,
+                cmt_count: store.comment.length,
+                lnk_count: store.link.length,
+                mtime: Math.floor(Date.now() / 1000)
+              });
               renderTab();
               pLabel.textContent = `Hoàn tất ${msg.total_crawled} trang (Đã lưu Cache)`;
               pPercent.textContent = '100%';
@@ -500,7 +672,7 @@ HTML_UI = r"""
     function goMediaPage(p, totalPages) {
       if (p < 1 || p > totalPages) return;
       currentMediaPage = p;
-      if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage, true);
+      if (currentSlug) updateRouteDisplay(currentMediaPage, true);
       renderTab();
       window.scrollTo({ top: document.getElementById('viewerSection').offsetTop - 8, behavior: 'smooth' });
     }
@@ -595,7 +767,7 @@ HTML_UI = r"""
         if (isCrawlDone && currentMediaPage > effectiveTotal) {
           currentMediaPage = effectiveTotal;
         }
-        if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage, false);
+        if (currentSlug) updateRouteDisplay(currentMediaPage, false);
 
         const startIdx = (currentMediaPage - 1) * MEDIA_PER_PAGE;
         const pageItems = filtered.slice(startIdx, startIdx + MEDIA_PER_PAGE);
@@ -622,7 +794,7 @@ HTML_UI = r"""
         return;
       }
 
-      if (currentRoute) updateRouteDisplay(currentRoute, 1, false);
+      if (currentSlug) updateRouteDisplay(1, false);
 
       if (currentTab === 'comment') {
         filtered = store.comment.filter(c => !q || c.text.toLowerCase().includes(q) || c.author.toLowerCase().includes(q));
@@ -745,21 +917,23 @@ class Handler(BaseHTTPRequestHandler):
                 qs = parsed_req.query
                 m_q = re.search(r"(?:^|&)path=([^&]+)", qs)
                 target_path = urllib.request.unquote(m_q.group(1)) if m_q else ""
-                cached_data, page_num = find_cached_by_route(target_path)
+                cached_data, page_num, tab_key = find_cached_by_route(target_path)
                 if cached_data:
                     resp = {
                         "found": True,
                         "url": cached_data.get("url", ""),
                         "title": cached_data.get("title", ""),
                         "route": cached_data.get("route", ""),
+                        "tab": tab_key,
                         "page": page_num,
                     }
                 else:
-                    m_p = re.match(r"^(/locanhvideo/[^/]+?)(?:/page(\d+))?/?$", target_path or "")
+                    parsed_r = parse_classified_route(target_path)
                     resp = {
                         "found": False,
-                        "route": m_p.group(1) if m_p else "",
-                        "page": int(m_p.group(2)) if (m_p and m_p.group(2)) else 1,
+                        "route": parsed_r["base_route"] if parsed_r else "",
+                        "tab": parsed_r["tab"] if parsed_r else "image",
+                        "page": parsed_r["page"] if parsed_r else 1,
                     }
                 payload = json.dumps(resp, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
