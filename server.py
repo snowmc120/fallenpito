@@ -29,6 +29,10 @@ HTML_UI = r"""
     }
     .btn-red { background: #e50914; }
     .btn-dark { background: #333; }
+    .route-bar {
+      font-size: 11px; color: #9ca3af; background: #131313; border: 1px solid #262626;
+      padding: 6px 8px; border-radius: 8px; margin-top: 8px; word-break: break-all; display: none;
+    }
     .progress-wrap { margin-top: 6px; display: none; }
     .progress-bar-bg { width: 100%; height: 6px; background: #2a2a2a; border-radius: 4px; overflow: hidden; margin-top: 5px; }
     .progress-bar-fill { height: 100%; width: 0%; background: #e50914; transition: width 0.15s; }
@@ -69,13 +73,25 @@ HTML_UI = r"""
       border-radius: 8px; font-size: 12px; font-weight: 600; text-align: center; cursor: pointer;
     }
     .tab-btn.active { background: #e50914; border-color: #e50914; color: #fff; }
+    .pager {
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      background: #181818; border: 1px solid #2b2b2b; border-radius: 10px;
+      padding: 8px 10px; margin: 8px 0; font-size: 12px;
+    }
+    .pager-btn {
+      background: #262626; border: 1px solid #3b3b3b; color: #fff;
+      padding: 6px 10px; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer;
+    }
+    .pager-btn.active { background: #e50914; border-color: #e50914; }
+    .pager-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .pager-pages { display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; }
     .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; align-items: start; }
     .card { background: #171717; border-radius: 10px; overflow: hidden; border: 1px solid #262626; }
-    .thumb-box { position: relative; width: 100%; background: #000; }
+    .thumb-box { position: relative; width: 100%; background: #000; min-height: 110px; }
     .thumb { width: 100%; height: auto; object-fit: contain; display: block; }
     .page-badge {
       position: absolute; bottom: 6px; left: 6px; background: rgba(229,9,20,0.9);
-      color: #fff; font-size: 10px; font-weight: 600; padding: 2px 5px; border-radius: 4px;
+      color: #fff; font-size: 10px; font-weight: 600; padding: 2px 5px; border-radius: 4px; z-index: 2;
     }
     .info { padding: 7px 8px; font-size: 11px; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .list-item {
@@ -128,6 +144,8 @@ HTML_UI = r"""
       <input type="text" id="searchInput" placeholder="Lọc cực nhanh theo tên, tác giả, trang..." oninput="resetRender()">
     </div>
 
+    <div class="route-bar" id="routeBar"></div>
+
     <div class="progress-wrap" id="progressWrap">
       <div class="status-text">
         <span id="progressLabel">Đang chuẩn bị...</span>
@@ -174,13 +192,32 @@ HTML_UI = r"""
   <script>
     let store = { image: [], video: [], comment: [], link: [] };
     let currentTab = 'image';
+    let currentMediaPage = 1;
+    const MEDIA_PER_PAGE = 5;
     let renderLimit = 40;
+    let currentRoute = '';
     let abortCtrl = null;
     let currentIdx = 0;
     window.allFilteredMedia = [];
 
     document.getElementById('cookieInput').value = localStorage.getItem('xam_cookie') || '';
     function saveCookie() { localStorage.setItem('xam_cookie', document.getElementById('cookieInput').value.trim()); }
+
+    function updateRouteDisplay(route, pageNum) {
+      const bar = document.getElementById('routeBar');
+      if (!route) {
+        bar.style.display = 'none';
+        return;
+      }
+      currentRoute = route;
+      const suffix = (currentTab === 'image' || currentTab === 'video') ? `/page${pageNum || currentMediaPage}` : '';
+      const fullPath = `${route}${suffix}`;
+      bar.style.display = 'block';
+      bar.textContent = `Đường dẫn: ${window.location.origin}${fullPath}`;
+      try {
+        history.replaceState(null, '', fullPath);
+      } catch (e) {}
+    }
 
     function formatTimeAgo(ts) {
       if (!ts) return '';
@@ -249,12 +286,14 @@ HTML_UI = r"""
 
     function switchTab(tab) {
       currentTab = tab;
+      currentMediaPage = 1;
       document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
       document.getElementById('tab-' + tab).classList.add('active');
       resetRender();
     }
 
     function resetRender() {
+      currentMediaPage = 1;
       renderLimit = 40;
       renderTab();
     }
@@ -282,6 +321,7 @@ HTML_UI = r"""
       }
 
       store = { image: [], video: [], comment: [], link: [] };
+      currentMediaPage = 1;
       updateCounters();
       resetRender();
 
@@ -318,6 +358,7 @@ HTML_UI = r"""
             const msg = JSON.parse(line);
 
             if (msg.error) { pLabel.textContent = 'Lỗi: ' + msg.error; return; }
+            if (msg.route) updateRouteDisplay(msg.route, currentMediaPage);
 
             if (msg.cached) {
               store.image = msg.data.images || [];
@@ -325,6 +366,7 @@ HTML_UI = r"""
               store.comment = msg.data.comments || [];
               store.link = msg.data.links || [];
               if (msg.data.title) document.getElementById('viewerTitle').textContent = msg.data.title;
+              if (msg.data.route) updateRouteDisplay(msg.data.route, currentMediaPage);
               updateCounters();
               resetRender();
               pLabel.textContent = 'Nạp tức thì từ Cache (bấm ↻ nếu muốn cào mới)';
@@ -360,6 +402,65 @@ HTML_UI = r"""
       }
     }
 
+    function goMediaPage(p, totalPages) {
+      if (p < 1 || p > totalPages) return;
+      currentMediaPage = p;
+      renderTab();
+      window.scrollTo({ top: document.getElementById('viewerSection').offsetTop - 8, behavior: 'smooth' });
+    }
+
+    function buildPagerHtml(totalPages) {
+      if (totalPages <= 1) return '';
+      const startP = Math.max(1, currentMediaPage - 2);
+      const endP = Math.min(totalPages, startP + 4);
+      let numsHtml = '';
+      for (let p = startP; p <= endP; p++) {
+        numsHtml += `<button class="pager-btn ${p === currentMediaPage ? 'active' : ''}" onclick="goMediaPage(${p}, ${totalPages})">${p}</button>`;
+      }
+      return `
+        <div class="pager">
+          <button class="pager-btn" ${currentMediaPage <= 1 ? 'disabled' : ''} onclick="goMediaPage(${currentMediaPage - 1}, ${totalPages})">‹ Trước</button>
+          <div class="pager-pages">${numsHtml}</div>
+          <button class="pager-btn" ${currentMediaPage >= totalPages ? 'disabled' : ''} onclick="goMediaPage(${currentMediaPage + 1}, ${totalPages})">Sau ›</button>
+        </div>
+      `;
+    }
+
+    function setupFastVideoThumbs() {
+      const vids = document.querySelectorAll('video.fast-vid');
+      if (!vids.length) return;
+
+      const loadSingleVideoFrame = (vid) => {
+        if (vid.dataset.loaded) return;
+        vid.dataset.loaded = '1';
+        const src = vid.dataset.src;
+        if (!src) return;
+        vid.preload = 'metadata';
+        vid.src = src + '#t=0.2';
+        vid.addEventListener('loadedmetadata', () => {
+          try {
+            if (vid.duration && vid.duration > 0.3) {
+              vid.currentTime = 0.2;
+            }
+          } catch (e) {}
+        }, { once: true });
+      };
+
+      if ('IntersectionObserver' in window) {
+        const io = new IntersectionObserver((entries, obs) => {
+          entries.forEach(entry => {
+            if (entry.isIntersecting) {
+              loadSingleVideoFrame(entry.target);
+              obs.unobserve(entry.target);
+            }
+          });
+        }, { rootMargin: '120px' });
+        vids.forEach(v => io.observe(v));
+      } else {
+        vids.forEach(loadSingleVideoFrame);
+      }
+    }
+
     function renderTab() {
       const q = document.getElementById('searchInput').value.toLowerCase().trim();
       const area = document.getElementById('contentArea');
@@ -368,29 +469,47 @@ HTML_UI = r"""
       if (currentTab === 'image' || currentTab === 'video') {
         filtered = store[currentTab].filter(i => !q || i.name.toLowerCase().includes(q) || ('p.' + i.page).includes(q));
         window.allFilteredMedia = filtered;
-      } else if (currentTab === 'comment') {
+
+        const totalPages = Math.max(1, Math.ceil(filtered.length / MEDIA_PER_PAGE));
+        if (currentMediaPage > totalPages) currentMediaPage = totalPages;
+        if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage);
+
+        const startIdx = (currentMediaPage - 1) * MEDIA_PER_PAGE;
+        const pageItems = filtered.slice(startIdx, startIdx + MEDIA_PER_PAGE);
+        const pagerHtml = buildPagerHtml(totalPages);
+
+        const cardsHtml = `<div class="grid">` + pageItems.map((i, localIdx) => {
+          const globalIdx = startIdx + localIdx;
+          return `
+            <div class="card" onclick="openModal(${globalIdx})">
+              <div class="thumb-box">
+                <span class="page-badge">P.${i.page}</span>
+                ${currentTab === 'video'
+                  ? `<video class="thumb fast-vid" data-src="${i.url}" preload="none" muted playsinline></video>`
+                  : `<img class="thumb" src="${i.url}" loading="eager" decoding="async" referrerpolicy="no-referrer">`
+                }
+              </div>
+              <div class="info">${i.name}</div>
+            </div>
+          `;
+        }).join('') + `</div>`;
+
+        area.innerHTML = pagerHtml + cardsHtml + pagerHtml;
+        if (currentTab === 'video') setupFastVideoThumbs();
+        return;
+      }
+
+      if (currentRoute) updateRouteDisplay(currentRoute, 1);
+
+      if (currentTab === 'comment') {
         filtered = store.comment.filter(c => !q || c.text.toLowerCase().includes(q) || c.author.toLowerCase().includes(q));
       } else {
         filtered = store.link.filter(l => !q || l.url.toLowerCase().includes(q) || l.author.toLowerCase().includes(q));
       }
 
       const visible = filtered.slice(0, renderLimit);
-
       let html = '';
-      if (currentTab === 'image' || currentTab === 'video') {
-        html = `<div class="grid">` + visible.map((i, idx) => `
-          <div class="card" onclick="openModal(${idx})">
-            <div class="thumb-box">
-              <span class="page-badge">P.${i.page}</span>
-              ${currentTab === 'video'
-                ? `<video class="thumb" src="${i.url}#t=0.5" preload="metadata" muted playsinline></video>`
-                : `<img class="thumb" src="${i.url}" loading="lazy" referrerpolicy="no-referrer">`
-              }
-            </div>
-            <div class="info">${i.name}</div>
-          </div>
-        `).join('') + `</div>`;
-      } else if (currentTab === 'comment') {
+      if (currentTab === 'comment') {
         html = visible.map(c => `
           <div class="list-item">
             <div class="list-head"><span>@${c.author}</span><span>Trang ${c.page}</span></div>
