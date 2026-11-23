@@ -37,6 +37,27 @@ def build_custom_route(raw_url, title=""):
     return f"/locanhvideo/{slug}"
 
 
+def find_cached_by_route(route_path):
+    m = re.match(r"^(/locanhvideo/[^/]+?)(?:/page(\d+))?/?$", route_path or "")
+    if not m:
+        return None, 1
+    base_route = m.group(1)
+    page_num = int(m.group(2)) if m.group(2) else 1
+    for item in list_cached_threads():
+        if item.get("route") == base_route:
+            cache_file = get_cache_path(item["url"])
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if "route" not in data:
+                        data["route"] = base_route
+                    return data, page_num
+                except Exception:
+                    pass
+    return None, page_num
+
+
 def has_supported_media_ext(full_url, exts):
     clean_path = urlparse(full_url).path.lower()
     return any(clean_path.endswith(ext) for ext in exts)
