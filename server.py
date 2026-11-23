@@ -76,17 +76,19 @@ HTML_UI = r"""
     }
     .tab-btn.active { background: #e50914; border-color: #e50914; color: #fff; }
     .pager {
-      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      display: flex; justify-content: space-between; align-items: center; gap: 6px;
       background: #181818; border: 1px solid #2b2b2b; border-radius: 10px;
       padding: 8px 10px; margin: 8px 0; font-size: 12px;
     }
     .pager-btn {
       background: #262626; border: 1px solid #3b3b3b; color: #fff;
-      padding: 6px 10px; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer;
+      padding: 6px 9px; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer;
+      min-width: 30px; text-align: center;
     }
     .pager-btn.active { background: #e50914; border-color: #e50914; }
     .pager-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    .pager-pages { display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; }
+    .pager-ellipsis { color: #888; padding: 0 3px; font-size: 12px; user-select: none; }
+    .pager-pages { display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; align-items: center; }
     .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; align-items: start; }
     .card { background: #171717; border-radius: 10px; overflow: hidden; border: 1px solid #262626; }
     .thumb-box { position: relative; width: 100%; background: #000; min-height: 110px; }
@@ -195,7 +197,8 @@ HTML_UI = r"""
     let store = { image: [], video: [], comment: [], link: [] };
     let currentTab = 'image';
     let currentMediaPage = 1;
-    const MEDIA_PER_PAGE = 5;
+    let isCrawlDone = false;
+    const MEDIA_PER_PAGE = 6;
     let renderLimit = 40;
     let currentRoute = '';
     let lastActiveUrl = localStorage.getItem('fallenpito_last_url') || '';
@@ -410,9 +413,9 @@ HTML_UI = r"""
 
       store = { image: [], video: [], comment: [], link: [] };
       currentMediaPage = initialPage;
+      isCrawlDone = false;
       updateCounters();
-      resetRender();
-      currentMediaPage = initialPage;
+      renderTab();
 
       const pWrap = document.getElementById('progressWrap');
       const pLabel = document.getElementById('progressLabel');
@@ -454,6 +457,7 @@ HTML_UI = r"""
               store.video = msg.data.videos || [];
               store.comment = msg.data.comments || [];
               store.link = msg.data.links || [];
+              isCrawlDone = true;
               if (msg.data.title) document.getElementById('viewerTitle').textContent = msg.data.title;
               if (msg.data.route) updateRouteDisplay(msg.data.route, currentMediaPage, false);
               updateCounters();
@@ -480,6 +484,8 @@ HTML_UI = r"""
             renderTab();
 
             if (msg.done) {
+              isCrawlDone = true;
+              renderTab();
               pLabel.textContent = `Hoàn tất ${msg.total_crawled} trang (Đã lưu Cache)`;
               pPercent.textContent = '100%';
               pFill.style.width = '100%';
@@ -499,14 +505,36 @@ HTML_UI = r"""
       window.scrollTo({ top: document.getElementById('viewerSection').offsetTop - 8, behavior: 'smooth' });
     }
 
+    function getCompactPages(cur, total) {
+      if (total <= 9) {
+        return Array.from({ length: total }, (_, idx) => idx + 1);
+      }
+      const set = new Set([1, total]);
+      if (cur <= 6) {
+        for (let i = 1; i <= 6; i++) set.add(i);
+        if (total >= 10) set.add(10);
+      } else {
+        for (let i = Math.max(1, cur - 2); i <= Math.min(total, cur + 2); i++) set.add(i);
+        if (total >= 10 && Math.abs(cur - 10) > 2) set.add(10);
+      }
+      const sorted = Array.from(set).sort((a, b) => a - b);
+      const out = [];
+      for (let i = 0; i < sorted.length; i++) {
+        if (i > 0 && sorted[i] - sorted[i - 1] > 1) {
+          out.push('…');
+        }
+        out.push(sorted[i]);
+      }
+      return out;
+    }
+
     function buildPagerHtml(totalPages) {
       if (totalPages <= 1) return '';
-      const startP = Math.max(1, currentMediaPage - 2);
-      const endP = Math.min(totalPages, startP + 4);
-      let numsHtml = '';
-      for (let p = startP; p <= endP; p++) {
-        numsHtml += `<button class="pager-btn ${p === currentMediaPage ? 'active' : ''}" onclick="goMediaPage(${p}, ${totalPages})">${p}</button>`;
-      }
+      const tokens = getCompactPages(currentMediaPage, totalPages);
+      const numsHtml = tokens.map(tok => {
+        if (tok === '…') return `<span class="pager-ellipsis">…</span>`;
+        return `<button class="pager-btn ${tok === currentMediaPage ? 'active' : ''}" onclick="goMediaPage(${tok}, ${totalPages})">${tok}</button>`;
+      }).join('');
       return `
         <div class="pager">
           <button class="pager-btn" ${currentMediaPage <= 1 ? 'disabled' : ''} onclick="goMediaPage(${currentMediaPage - 1}, ${totalPages})">‹ Trước</button>
@@ -560,13 +588,18 @@ HTML_UI = r"""
         filtered = store[currentTab].filter(i => !q || i.name.toLowerCase().includes(q) || ('p.' + i.page).includes(q));
         window.allFilteredMedia = filtered;
 
-        const totalPages = Math.max(1, Math.ceil(filtered.length / MEDIA_PER_PAGE));
-        if (currentMediaPage > totalPages) currentMediaPage = totalPages;
+        const effectiveTotal = isCrawlDone
+          ? Math.max(1, Math.ceil(filtered.length / MEDIA_PER_PAGE))
+          : Math.max(currentMediaPage, Math.ceil(filtered.length / MEDIA_PER_PAGE));
+
+        if (isCrawlDone && currentMediaPage > effectiveTotal) {
+          currentMediaPage = effectiveTotal;
+        }
         if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage, false);
 
         const startIdx = (currentMediaPage - 1) * MEDIA_PER_PAGE;
         const pageItems = filtered.slice(startIdx, startIdx + MEDIA_PER_PAGE);
-        const pagerHtml = buildPagerHtml(totalPages);
+        const pagerHtml = buildPagerHtml(effectiveTotal);
 
         const cardsHtml = `<div class="grid">` + pageItems.map((i, localIdx) => {
           const globalIdx = startIdx + localIdx;
