@@ -1,11 +1,13 @@
 import json
 import os
+import re
 import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-from crawler import crawl_fast_stream, list_cached_threads
+from urllib.parse import urlparse
+from crawler import crawl_fast_stream, list_cached_threads, find_cached_by_route
 
 HTML_UI = r"""
 <!DOCTYPE html>
@@ -196,28 +198,64 @@ HTML_UI = r"""
     const MEDIA_PER_PAGE = 5;
     let renderLimit = 40;
     let currentRoute = '';
+    let lastActiveUrl = localStorage.getItem('fallenpito_last_url') || '';
     let abortCtrl = null;
     let currentIdx = 0;
     window.allFilteredMedia = [];
 
     document.getElementById('cookieInput').value = localStorage.getItem('xam_cookie') || '';
+    if (lastActiveUrl && !document.getElementById('threadUrl').value) {
+      document.getElementById('threadUrl').value = lastActiveUrl;
+    }
     function saveCookie() { localStorage.setItem('xam_cookie', document.getElementById('cookieInput').value.trim()); }
 
-    function updateRouteDisplay(route, pageNum) {
+    function parsePageFromPath(pathname) {
+      const m = (pathname || '').match(/^(\/locanhvideo\/[^/]+?)(?:\/page(\d+))?\/?$/);
+      if (!m) return { route: '', page: 1 };
+      return { route: m[1], page: m[2] ? parseInt(m[2], 10) : 1 };
+    }
+
+    function updateRouteDisplay(route, pageNum, pushHistory) {
       const bar = document.getElementById('routeBar');
       if (!route) {
         bar.style.display = 'none';
         return;
       }
       currentRoute = route;
-      const suffix = (currentTab === 'image' || currentTab === 'video') ? `/page${pageNum || currentMediaPage}` : '';
+      const p = pageNum || currentMediaPage || 1;
+      const suffix = (currentTab === 'image' || currentTab === 'video') ? `/page${p}` : '';
       const fullPath = `${route}${suffix}`;
       bar.style.display = 'block';
       bar.textContent = `Đường dẫn: ${window.location.origin}${fullPath}`;
       try {
-        history.replaceState(null, '', fullPath);
+        if (pushHistory && window.location.pathname !== fullPath) {
+          history.pushState({ route, page: p, tab: currentTab }, '', fullPath);
+        } else if (window.location.pathname !== fullPath) {
+          history.replaceState({ route, page: p, tab: currentTab }, '', fullPath);
+        }
       } catch (e) {}
     }
+
+    window.addEventListener('popstate', (e) => {
+      const state = e.state;
+      if (state && state.route) {
+        currentRoute = state.route;
+        if (state.tab) currentTab = state.tab;
+        currentMediaPage = state.page || 1;
+        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+        const activeBtn = document.getElementById('tab-' + currentTab);
+        if (activeBtn) activeBtn.classList.add('active');
+        document.getElementById('historySection').style.display = 'none';
+        document.getElementById('viewerSection').style.display = 'block';
+        renderTab();
+        return;
+      }
+      const parsed = parsePageFromPath(window.location.pathname);
+      if (parsed.route && currentRoute === parsed.route && (currentTab === 'image' || currentTab === 'video')) {
+        currentMediaPage = parsed.page;
+        renderTab();
+      }
+    });
 
     function formatTimeAgo(ts) {
       if (!ts) return '';
@@ -269,20 +307,49 @@ HTML_UI = r"""
     }
 
     function openHistoryItem(item) {
+      lastActiveUrl = item.url;
+      localStorage.setItem('fallenpito_last_url', lastActiveUrl);
       document.getElementById('threadUrl').value = item.url;
       document.getElementById('viewerTitle').textContent = item.title;
-      startCrawl(false);
+      startCrawl(false, 1);
     }
 
     function backToHistory() {
       if (abortCtrl) abortCtrl.abort();
+      if (lastActiveUrl) {
+        document.getElementById('threadUrl').value = lastActiveUrl;
+      }
       document.getElementById('viewerSection').style.display = 'none';
       document.getElementById('progressWrap').style.display = 'none';
       document.getElementById('historySection').style.display = 'block';
+      try {
+        history.replaceState(null, '', '/');
+      } catch (e) {}
       loadHistory();
     }
 
-    loadHistory();
+    async function initFromCurrentPath() {
+      await loadHistory();
+      const parsed = parsePageFromPath(window.location.pathname);
+      if (parsed.route) {
+        try {
+          const res = await fetch('/lookup-route?path=' + encodeURIComponent(window.location.pathname));
+          if (res.ok) {
+            const info = await res.json();
+            if (info && info.found && info.url) {
+              lastActiveUrl = info.url;
+              localStorage.setItem('fallenpito_last_url', lastActiveUrl);
+              document.getElementById('threadUrl').value = info.url;
+              if (info.title) document.getElementById('viewerTitle').textContent = info.title;
+              startCrawl(false, info.page || parsed.page || 1);
+              return;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    initFromCurrentPath();
 
     function switchTab(tab) {
       currentTab = tab;
@@ -290,6 +357,7 @@ HTML_UI = r"""
       document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
       document.getElementById('tab-' + tab).classList.add('active');
       resetRender();
+      if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage, true);
     }
 
     function resetRender() {
@@ -305,11 +373,31 @@ HTML_UI = r"""
       document.getElementById('tab-link').textContent = `Link (${store.link.length})`;
     }
 
-    async function startCrawl(forceRefresh) {
-      const url = document.getElementById('threadUrl').value.trim();
+    async function startCrawl(forceRefresh, targetPage) {
+      let url = document.getElementById('threadUrl').value.trim();
       const cookie = document.getElementById('cookieInput').value.trim();
       const maxPages = parseInt(document.getElementById('maxPages').value) || 30;
       if (!url) return alert('Chưa dán link!');
+
+      let initialPage = targetPage || 1;
+      try {
+        const parsedInput = new URL(url);
+        const pathInfo = parsePageFromPath(parsedInput.pathname);
+        if (pathInfo.route) {
+          if (!targetPage) initialPage = pathInfo.page;
+          const resLookup = await fetch('/lookup-route?path=' + encodeURIComponent(parsedInput.pathname));
+          if (resLookup.ok) {
+            const info = await resLookup.json();
+            if (info && info.found && info.url) {
+              url = info.url;
+              document.getElementById('threadUrl').value = url;
+            }
+          }
+        }
+      } catch (e) {}
+
+      lastActiveUrl = url;
+      localStorage.setItem('fallenpito_last_url', lastActiveUrl);
 
       if (abortCtrl) abortCtrl.abort();
       abortCtrl = new AbortController();
@@ -321,9 +409,10 @@ HTML_UI = r"""
       }
 
       store = { image: [], video: [], comment: [], link: [] };
-      currentMediaPage = 1;
+      currentMediaPage = initialPage;
       updateCounters();
       resetRender();
+      currentMediaPage = initialPage;
 
       const pWrap = document.getElementById('progressWrap');
       const pLabel = document.getElementById('progressLabel');
@@ -358,7 +447,7 @@ HTML_UI = r"""
             const msg = JSON.parse(line);
 
             if (msg.error) { pLabel.textContent = 'Lỗi: ' + msg.error; return; }
-            if (msg.route) updateRouteDisplay(msg.route, currentMediaPage);
+            if (msg.route) updateRouteDisplay(msg.route, currentMediaPage, false);
 
             if (msg.cached) {
               store.image = msg.data.images || [];
@@ -366,9 +455,9 @@ HTML_UI = r"""
               store.comment = msg.data.comments || [];
               store.link = msg.data.links || [];
               if (msg.data.title) document.getElementById('viewerTitle').textContent = msg.data.title;
-              if (msg.data.route) updateRouteDisplay(msg.data.route, currentMediaPage);
+              if (msg.data.route) updateRouteDisplay(msg.data.route, currentMediaPage, false);
               updateCounters();
-              resetRender();
+              renderTab();
               pLabel.textContent = 'Nạp tức thì từ Cache (bấm ↻ nếu muốn cào mới)';
               pPercent.textContent = '100%';
               pFill.style.width = '100%';
@@ -405,6 +494,7 @@ HTML_UI = r"""
     function goMediaPage(p, totalPages) {
       if (p < 1 || p > totalPages) return;
       currentMediaPage = p;
+      if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage, true);
       renderTab();
       window.scrollTo({ top: document.getElementById('viewerSection').offsetTop - 8, behavior: 'smooth' });
     }
@@ -472,7 +562,7 @@ HTML_UI = r"""
 
         const totalPages = Math.max(1, Math.ceil(filtered.length / MEDIA_PER_PAGE));
         if (currentMediaPage > totalPages) currentMediaPage = totalPages;
-        if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage);
+        if (currentRoute) updateRouteDisplay(currentRoute, currentMediaPage, false);
 
         const startIdx = (currentMediaPage - 1) * MEDIA_PER_PAGE;
         const pageItems = filtered.slice(startIdx, startIdx + MEDIA_PER_PAGE);
@@ -499,7 +589,7 @@ HTML_UI = r"""
         return;
       }
 
-      if (currentRoute) updateRouteDisplay(currentRoute, 1);
+      if (currentRoute) updateRouteDisplay(currentRoute, 1, false);
 
       if (currentTab === 'comment') {
         filtered = store.comment.filter(c => !q || c.text.toLowerCase().includes(q) || c.author.toLowerCase().includes(q));
@@ -593,7 +683,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/ping":
+        parsed_req = urlparse(self.path)
+        req_path = parsed_req.path
+
+        if req_path == "/ping":
             try:
                 self.send_response(200)
                 self.end_headers()
@@ -602,7 +695,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
 
-        if self.path == "/history":
+        if req_path == "/history":
             try:
                 items = list_cached_threads()
                 payload = json.dumps(items, ensure_ascii=False).encode("utf-8")
@@ -614,7 +707,37 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
 
-        if self.path == "/favicon.ico":
+        if req_path == "/lookup-route":
+            try:
+                qs = parsed_req.query
+                m_q = re.search(r"(?:^|&)path=([^&]+)", qs)
+                target_path = urllib.request.unquote(m_q.group(1)) if m_q else ""
+                cached_data, page_num = find_cached_by_route(target_path)
+                if cached_data:
+                    resp = {
+                        "found": True,
+                        "url": cached_data.get("url", ""),
+                        "title": cached_data.get("title", ""),
+                        "route": cached_data.get("route", ""),
+                        "page": page_num,
+                    }
+                else:
+                    m_p = re.match(r"^(/locanhvideo/[^/]+?)(?:/page(\d+))?/?$", target_path or "")
+                    resp = {
+                        "found": False,
+                        "route": m_p.group(1) if m_p else "",
+                        "page": int(m_p.group(2)) if (m_p and m_p.group(2)) else 1,
+                    }
+                payload = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        if req_path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
             return
