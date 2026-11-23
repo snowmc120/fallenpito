@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse, urlunparse
 import requests
@@ -9,6 +10,37 @@ from bs4 import BeautifulSoup
 
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp")
+VIDEO_EXTS = (".mp4", ".webm", ".mov", ".m4v", ".ogv")
+
+
+def slugify_name(text):
+    text = unicodedata.normalize("NFD", text or "")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.lower().replace("đ", "d")
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return slug or "thread"
+
+
+def build_custom_route(raw_url, title=""):
+    parsed = urlparse(raw_url)
+    path_parts = [
+        p for p in parsed.path.split("/")
+        if p and not re.match(r"^(page-\d+|post-\d+|latest|unread)$", p)
+    ]
+    source_name = title
+    if not source_name and path_parts:
+        last_seg = path_parts[-1]
+        source_name = re.sub(r"\.\d+$", "", last_seg)
+    slug = slugify_name(source_name)
+    return f"/locanhvideo/{slug}"
+
+
+def has_supported_media_ext(full_url, exts):
+    clean_path = urlparse(full_url).path.lower()
+    return any(clean_path.endswith(ext) for ext in exts)
+
 
 def normalize_thread_url(raw_url):
     parsed = urlparse(raw_url)
@@ -36,9 +68,11 @@ def list_cached_threads():
             url = data.get("url", "")
             if not url:
                 continue
+            title = data.get("title") or url
             items.append({
-                "title": data.get("title") or url,
+                "title": title,
                 "url": url,
+                "route": data.get("route") or build_custom_route(url, title),
                 "img_count": len(data.get("images", [])),
                 "vid_count": len(data.get("videos", [])),
                 "cmt_count": len(data.get("comments", [])),
@@ -117,20 +151,35 @@ def parse_html(html_text, page_url, page_num):
             full_url = urljoin(page_url, src)
             if is_junk_icon(img, full_url):
                 continue
-            images.append({"name": full_url.split("/")[-1].split("?")[0] or "img.jpg", "url": full_url, "page": page_num})
+            fname = full_url.split("/")[-1].split("?")[0] or "img.webp"
+            if has_supported_media_ext(full_url, VIDEO_EXTS):
+                videos.append({"name": fname, "url": full_url, "page": page_num})
+            else:
+                images.append({"name": fname, "url": full_url, "page": page_num})
 
         for vid in body.find_all(["video", "source"]):
             src = vid.get("data-src") or vid.get("src")
             if not src:
                 continue
             full_url = urljoin(page_url, src)
-            videos.append({"name": full_url.split("/")[-1].split("?")[0] or "vid.mp4", "url": full_url, "page": page_num})
+            fname = full_url.split("/")[-1].split("?")[0] or "vid.mp4"
+            if has_supported_media_ext(full_url, IMAGE_EXTS):
+                images.append({"name": fname, "url": full_url, "page": page_num})
+            else:
+                videos.append({"name": fname, "url": full_url, "page": page_num})
 
         for a in body.find_all("a", href=True):
             href = urljoin(page_url, a["href"])
             parsed_h = urlparse(href)
             if parsed_h.scheme in ("http", "https") and parsed_h.netloc and parsed_h.netloc != thread_domain:
-                links.append({"author": author, "url": href, "page": page_num})
+                if has_supported_media_ext(href, VIDEO_EXTS):
+                    fname = href.split("/")[-1].split("?")[0] or "vid.mp4"
+                    videos.append({"name": fname, "url": href, "page": page_num})
+                elif has_supported_media_ext(href, IMAGE_EXTS):
+                    fname = href.split("/")[-1].split("?")[0] or "img.webp"
+                    images.append({"name": fname, "url": href, "page": page_num})
+                else:
+                    links.append({"author": author, "url": href, "page": page_num})
 
         text = body.get_text(" ", strip=True)
         if len(text) > 1:
@@ -145,13 +194,15 @@ def crawl_fast_stream(raw_url, cookie, max_pages, force_refresh=False):
     if not force_refresh and os.path.exists(cache_file):
         with open(cache_file, "r", encoding="utf-8") as f:
             cached_data = json.load(f)
+        if "route" not in cached_data:
+            cached_data["route"] = build_custom_route(base_url, cached_data.get("title", ""))
         yield {"cached": True, "data": cached_data}
         return
 
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/avif,*/*;q=0.8",
     }
     if cookie:
         headers["Cookie"] = cookie
@@ -165,6 +216,7 @@ def crawl_fast_stream(raw_url, cookie, max_pages, force_refresh=False):
     soup1, imgs1, vids1, cmts1, lks1 = parse_html(res1.text, base_url, 1)
     title_el = soup1.select_one("h1.p-title-value") or soup1.title
     title = title_el.get_text(strip=True) if title_el else base_url
+    route = build_custom_route(base_url, title)
 
     total_pages = min(detect_total_pages(soup1), max_pages)
 
@@ -192,7 +244,7 @@ def crawl_fast_stream(raw_url, cookie, max_pages, force_refresh=False):
         return new_i, new_v, cmts, new_l
 
     ni, nv, nc, nl = merge_batch(imgs1, vids1, cmts1, lks1)
-    yield {"progress": True, "done_pages": 1, "total": total_pages, "images": ni, "videos": nv, "comments": nc, "links": nl}
+    yield {"progress": True, "done_pages": 1, "total": total_pages, "route": route, "images": ni, "videos": nv, "comments": nc, "links": nl}
 
     if total_pages > 1:
         def fetch_worker(p):
@@ -217,15 +269,16 @@ def crawl_fast_stream(raw_url, cookie, max_pages, force_refresh=False):
                 if result:
                     ni, nv, nc, nl = merge_batch(*result)
                     yield {
-                        "progress": True, "done_pages": completed, "total": total_pages,
+                        "progress": True, "done_pages": completed, "total": total_pages, "route": route,
                         "images": ni, "videos": nv, "comments": nc, "links": nl
                     }
                 else:
-                    yield {"progress": True, "done_pages": completed, "total": total_pages}
+                    yield {"progress": True, "done_pages": completed, "total": total_pages, "route": route}
 
     final_bundle = {
         "title": title,
         "url": base_url,
+        "route": route,
         "images": all_images,
         "videos": all_videos,
         "comments": all_comments,
@@ -234,4 +287,4 @@ def crawl_fast_stream(raw_url, cookie, max_pages, force_refresh=False):
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump(final_bundle, f, ensure_ascii=False)
 
-    yield {"done": True, "total_crawled": total_pages}
+    yield {"done": True, "total_crawled": total_pages, "route": route}
